@@ -29,6 +29,10 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import cv2
 
+
+VEHICLE_CLASSES = {'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'}
+
+
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
@@ -132,7 +136,64 @@ coco_cats = {} # Call prep_coco_cats to fill this
 coco_cats_inv = {}
 color_cache = defaultdict(lambda: {})
 
-def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45, fps_str=''):
+# def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45, fps_str='', save_mask_path=None):
+#     """
+#     Note: If undo_transform=False then im_h and im_w are allowed to be None.
+#     """
+#     if undo_transform:
+#         img_numpy = undo_image_transformation(img, w, h)
+#         img_gpu = torch.Tensor(img_numpy).cuda()
+#     else:
+#         img_gpu = img / 255.0
+#         h, w, _ = img.shape
+    
+#     with timer.env('Postprocess'):
+#         save = cfg.rescore_bbox
+#         cfg.rescore_bbox = True
+#         t = postprocess(dets_out, w, h, visualize_lincomb = args.display_lincomb,
+#                                         crop_masks        = args.crop,
+#                                         score_threshold   = args.score_threshold)
+#         cfg.rescore_bbox = save
+
+#     with timer.env('Copy'):
+#         idx = t[1].argsort(0, descending=True)[:args.top_k]
+        
+#         if cfg.eval_mask_branch:
+#             # Masks are drawn on the GPU, so don't copy
+#             masks = t[3][idx]
+#         classes, scores, boxes = [x[idx].cpu().numpy() for x in t[:3]]
+
+#     num_dets_to_consider = min(args.top_k, classes.shape[0])
+#     for j in range(num_dets_to_consider):
+#         if scores[j] < args.score_threshold:
+#             num_dets_to_consider = j
+#             break
+
+#     if save_mask_path and num_dets_to_consider > 0:
+#         vehicle_masks = []
+#         img_height, img_width = masks[0].shape[-2:]  # Get mask dimensions
+#         bottom_strip_height = 30  # Define bottom strip height
+
+#         for j in range(num_dets_to_consider):
+#             _class = cfg.dataset.class_names[classes[j]]
+#             if _class in VEHICLE_CLASSES:  # Check if class is in VEHICLE_CLASSES
+#                 mask = masks[j].cpu().numpy()
+
+#                 # Extract the bottom 10-pixel strip
+#                 lower_edge = mask[-bottom_strip_height:, :]  # Get last 10 rows
+#                 covered_pixels = np.sum(lower_edge > 0)  # Count non-zero (masked) pixels
+#                 coverage_ratio = covered_pixels / (bottom_strip_height * img_width)  # Compute coverage ratio
+
+#                 if coverage_ratio < 0.5:  # Ignore if 75% or more of bottom strip is covered
+#                     vehicle_masks.append(masks[j])
+
+#         if len(vehicle_masks) > 0:  # Ensure there are vehicle masks to save
+#             combined_mask = torch.sum(torch.stack(vehicle_masks), dim=0).cpu().numpy()
+#             mask_image = (combined_mask * 255).astype(np.uint8)
+#             cv2.imwrite(save_mask_path, mask_image)  # Save only vehicle masks
+
+
+def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45, fps_str='', save_mask_path=None):
     """
     Note: If undo_transform=False then im_h and im_w are allowed to be None.
     """
@@ -164,6 +225,38 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
         if scores[j] < args.score_threshold:
             num_dets_to_consider = j
             break
+
+    if save_mask_path:
+        # Create a black image by default
+        mask_image = np.zeros((h, w), dtype=np.uint8)
+        
+        if num_dets_to_consider > 0:
+            vehicle_masks = []
+            img_height, img_width = masks[0].shape[-2:]  # Get mask dimensions
+            bottom_strip_height = 30  # Define bottom strip height
+
+            for j in range(num_dets_to_consider):
+                _class = cfg.dataset.class_names[classes[j]]
+                if _class in VEHICLE_CLASSES:  # Check if class is in VEHICLE_CLASSES
+                    mask = masks[j].cpu().numpy()
+
+                    # Extract the bottom 10-pixel strip
+                    lower_edge = mask[-bottom_strip_height:, :]  # Get last 10 rows
+                    covered_pixels = np.sum(lower_edge > 0)  # Count non-zero (masked) pixels
+                    coverage_ratio = covered_pixels / (bottom_strip_height * img_width)  # Compute coverage ratio
+
+                    if coverage_ratio < 0.5:  # Ignore if 75% or more of bottom strip is covered
+                        vehicle_masks.append(masks[j])
+
+            if len(vehicle_masks) > 0:  # If we found valid vehicle masks
+                combined_mask = torch.sum(torch.stack(vehicle_masks), dim=0).cpu().numpy()
+                mask_image = (combined_mask * 255).astype(np.uint8)
+        
+        # Save the mask (will be black if no valid masks were found)
+        cv2.imwrite(save_mask_path, mask_image)
+
+
+
 
     # Quick and dirty lambda for selecting the color for a particular index
     # Also keeps track of a per-gpu color cache for maximum speed
@@ -597,7 +690,14 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     batch = FastBaseTransform()(frame.unsqueeze(0))
     preds = net(batch)
 
-    img_numpy = prep_display(preds, frame, None, None, undo_transform=False)
+    mask_folder = "masks"
+    os.makedirs(mask_folder, exist_ok=True) 
+
+    filename = os.path.basename(path).replace(".jpg", "_mask.jpg")
+    mask_save_path = os.path.join(mask_folder, filename)
+
+    #mask_save_path = save_path.replace(".jpg", "_mask.jpg") if save_path else None
+    img_numpy = prep_display(preds, frame, None, None, undo_transform=False, save_mask_path=mask_save_path)
     
     if save_path is None:
         img_numpy = img_numpy[:, :, (2, 1, 0)]
@@ -652,10 +752,11 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     target_fps   = round(vid.get(cv2.CAP_PROP_FPS))
     frame_width  = round(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = round(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    num_frames   = round(vid.get(cv2.CAP_PROP_FRAME_COUNT))
     
     if is_webcam:
         num_frames = float('inf')
+    else:
+        num_frames = round(vid.get(cv2.CAP_PROP_FRAME_COUNT))
 
     net = CustomDataParallel(net).cuda()
     transform = torch.nn.DataParallel(FastBaseTransform()).cuda()
@@ -787,7 +888,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
             traceback.print_exc()
 
 
-    extract_frame = lambda x, i: (x[0][i] if x[1][i] is None else x[0][i].to(x[1][i]['detection']['box'].device), [x[1][i]])
+    extract_frame = lambda x, i: (x[0][i] if x[1][i]['detection'] is None else x[0][i].to(x[1][i]['detection']['box'].device), [x[1][i]])
 
     # Prime the network on the first frame because I do some thread unsafe things otherwise
     print('Initializing model... ', end='')
@@ -1015,59 +1116,20 @@ def calc_map(ap_data):
                     aps[iou_idx][iou_type].append(ap_obj.get_ap())
 
     all_maps = {'box': OrderedDict(), 'mask': OrderedDict()}
-    car_maps = {'box': OrderedDict(), 'mask': OrderedDict()}
-    ped_maps = {'box': OrderedDict(), 'mask': OrderedDict()}
-    truck_maps = {'box': OrderedDict(), 'mask': OrderedDict()}
-    bus_maps = {'box': OrderedDict(), 'mask': OrderedDict()}
-    rider_maps = {'box': OrderedDict(), 'mask': OrderedDict()}
 
     # Looking back at it, this code is really hard to read :/
     for iou_type in ('box', 'mask'):
         all_maps[iou_type]['all'] = 0 # Make this first in the ordereddict
-        car_maps[iou_type]['all'] = 0
-        ped_maps[iou_type]['all'] = 0
-        truck_maps[iou_type]['all'] = 0
-        bus_maps[iou_type]['all'] = 0
-        rider_maps[iou_type]['all'] = 0
-
         for i, threshold in enumerate(iou_thresholds):
             mAP = sum(aps[i][iou_type]) / len(aps[i][iou_type]) * 100 if len(aps[i][iou_type]) > 0 else 0
             all_maps[iou_type][int(threshold*100)] = mAP
-
-            car_maps[iou_type][int(threshold*100)] = aps[i][iou_type][0] * 100 
-            ped_maps[iou_type][int(threshold*100)] = aps[i][iou_type][1] * 100
-            truck_maps[iou_type][int(threshold*100)] = aps[i][iou_type][2] * 100
-            bus_maps[iou_type][int(threshold*100)] = aps[i][iou_type][3] * 100
-            rider_maps[iou_type][int(threshold*100)] = aps[i][iou_type][4] * 100
-
         all_maps[iou_type]['all'] = (sum(all_maps[iou_type].values()) / (len(all_maps[iou_type].values())-1))
-        car_maps[iou_type]['all'] = (sum(car_maps[iou_type].values()) / (len(car_maps[iou_type].values())-1))
-        ped_maps[iou_type]['all'] = (sum(ped_maps[iou_type].values()) / (len(ped_maps[iou_type].values())-1))
-        truck_maps[iou_type]['all'] = (sum(truck_maps[iou_type].values()) / (len(truck_maps[iou_type].values())-1))
-        bus_maps[iou_type]['all'] = (sum(bus_maps[iou_type].values()) / (len(bus_maps[iou_type].values())-1))
-        rider_maps[iou_type]['all'] = (sum(rider_maps[iou_type].values()) / (len(rider_maps[iou_type].values())-1))
     
     print_maps(all_maps)
-    print("Car mAP:")
-    print_maps(car_maps)
-    print("Pedestrian mAP:")
-    print_maps(ped_maps)
-    print("Truck mAP:")
-    print_maps(truck_maps)
-    print("Bus mAP:")
-    print_maps(bus_maps)
-    print("Rider mAP:")
-    print_maps(rider_maps)
     
     # Put in a prettier format so we can serialize it to json during training
     all_maps = {k: {j: round(u, 2) for j, u in v.items()} for k, v in all_maps.items()}
-    car_maps = {k: {j: round(u, 2) for j, u in v.items()} for k, v in car_maps.items()}
-    ped_maps = {k: {j: round(u, 2) for j, u in v.items()} for k, v in ped_maps.items()}
-    truck_maps = {k: {j: round(u, 2) for j, u in v.items()} for k, v in truck_maps.items()}
-    bus_maps = {k: {j: round(u, 2) for j, u in v.items()} for k, v in bus_maps.items()}
-    rider_maps = {k: {j: round(u, 2) for j, u in v.items()} for k, v in rider_maps.items()}
-    
-    return all_maps, car_maps, ped_maps, truck_maps, bus_maps, rider_maps
+    return all_maps
 
 def print_maps(all_maps):
     # Warning: hacky 
@@ -1141,5 +1203,4 @@ if __name__ == '__main__':
             net = net.cuda()
 
         evaluate(net, dataset)
-
 
